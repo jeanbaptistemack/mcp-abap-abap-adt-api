@@ -1,7 +1,7 @@
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
-import { ADTClient } from 'abap-adt-api';
+import { ADTClient, session_types } from 'abap-adt-api';
 
 export class CodeAnalysisHandlers extends BaseHandler {
     getTools(): ToolDefinition[] {
@@ -420,6 +420,10 @@ export class CodeAnalysisHandlers extends BaseHandler {
     async handleRunClass(args: any): Promise<any> {
         const startTime = performance.now();
         try {
+            // Force fresh ABAP session to avoid stale metadata cache
+            // after lock/setSource/activate in the same stateful session
+            await this.adtclient.dropSession();
+            this.adtclient.stateful = session_types.stateful;
             const result = await this.adtclient.runClass(args.className);
             this.trackRequest(startTime, true);
             return {
