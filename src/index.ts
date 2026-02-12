@@ -9,7 +9,7 @@ import {
   McpError,
   ErrorCode
 } from "@modelcontextprotocol/sdk/types.js";
-import { ADTClient, session_types } from "abap-adt-api";
+import { ADTClient, session_types, isCsrfError } from "abap-adt-api";
 import path from 'path';
 import { AuthHandlers } from './handlers/AuthHandlers.js';
 import { TransportHandlers } from './handlers/TransportHandlers.js';
@@ -144,6 +144,27 @@ export class AbapAdtServer extends Server {
     }
   }
 
+  private isSessionExpired(error: unknown): boolean {
+    // isCsrfError covers both CSRF token expired and "Session timed out" (HTTP 400)
+    if (isCsrfError(error)) return true;
+    // Also catch errors wrapped by handlers as McpError with session-related messages
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+      if (msg.includes('session timed out') || msg.includes('csrf token')) return true;
+    }
+    return false;
+  }
+
+  private async reconnect(): Promise<void> {
+    console.error('[MCP] Session expired, reconnecting...');
+    try {
+      await this.adtClient.dropSession();
+    } catch (_) { /* ignore dropSession errors */ }
+    this.adtClient.stateful = session_types.stateful;
+    await this.adtClient.login();
+    console.error('[MCP] Reconnected successfully');
+  }
+
   private handleError(error: unknown) {
     if (!(error instanceof Error)) {
       error = new Error(String(error));
@@ -214,15 +235,46 @@ export class AbapAdtServer extends Server {
     });
 
     this.setRequestHandler(CallToolRequestSchema, async (request) => {
-      try {
-        let result: any;
-        
-        switch (request.params.name) {
-            case 'login':
-            case 'logout':
-            case 'dropSession':
-                result = await this.authHandlers.handle(request.params.name, request.params.arguments);
-                break;
+      const { name } = request.params;
+      const args = request.params.arguments;
+
+      // Auth tools bypass retry logic (they manage the session themselves)
+      const AUTH_TOOLS = ['login', 'logout', 'dropSession'];
+      if (AUTH_TOOLS.includes(name)) {
+        try {
+          const result = await this.authHandlers.handle(name, args);
+          return this.serializeResult(result);
+        } catch (error) {
+          return this.handleError(error);
+        }
+      }
+
+      // All other tools: try once, auto-reconnect on session timeout, retry once
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const result = await this.dispatchTool(name, args);
+          return this.serializeResult(result);
+        } catch (error) {
+          if (attempt === 0 && this.isSessionExpired(error)) {
+            try {
+              await this.reconnect();
+              continue; // retry
+            } catch (reconnectError) {
+              console.error('[MCP] Reconnect failed:', reconnectError);
+              return this.handleError(error); // return original error
+            }
+          }
+          return this.handleError(error);
+        }
+      }
+      // Should never reach here, but TypeScript needs a return
+      return this.handleError(new Error('Unexpected retry exhaustion'));
+    });
+  }
+
+  private async dispatchTool(name: string, args: any): Promise<any> {
+      let result: any;
+      switch (name) {
             case 'transportInfo':
             case 'createTransport':
             case 'hasTransportConfig':
@@ -238,22 +290,22 @@ export class AbapAdtServer extends Server {
             case 'transportAddUser':
             case 'systemUsers':
             case 'transportReference':
-                result = await this.transportHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.transportHandlers.handle(name, args);
                 break;
             case 'lock':
             case 'unLock':
-                result = await this.objectLockHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectLockHandlers.handle(name, args);
                 break;
             case 'objectStructure':
             case 'searchObject':
             case 'findObjectPath':
             case 'objectTypes':
             case 'reentranceTicket':
-                result = await this.objectHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectHandlers.handle(name, args);
                 break;
             case 'classIncludes':
             case 'classComponents':
-                result = await this.classHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.classHandlers.handle(name, args);
                 break;
             case 'syntaxCheckCode':
             case 'syntaxCheckCdsUrl':
@@ -269,28 +321,28 @@ export class AbapAdtServer extends Server {
             case 'fixEdits':
             case 'fragmentMappings':
             case 'abapDocumentation':
-                result = await this.codeAnalysisHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.codeAnalysisHandlers.handle(name, args);
                 break;
             case 'getObjectSource':
             case 'setObjectSource':
-                result = await this.objectSourceHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectSourceHandlers.handle(name, args);
                 break;
             case 'deleteObject':
-                result = await this.objectDeletionHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectDeletionHandlers.handle(name, args);
                 break;
             case 'activateObjects':
             case 'activateByName':
             case 'inactiveObjects':
-                result = await this.objectManagementHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectManagementHandlers.handle(name, args);
                 break;
             case 'objectRegistrationInfo':
             case 'validateNewObject':
             case 'createObject':
-                result = await this.objectRegistrationHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.objectRegistrationHandlers.handle(name, args);
                 break;
             case 'nodeContents':
             case 'mainPrograms':
-                result = await this.nodeHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.nodeHandlers.handle(name, args);
                 break;
             case 'featureDetails':
             case 'collectionFeatureDetails':
@@ -299,18 +351,18 @@ export class AbapAdtServer extends Server {
             case 'adtDiscovery':
             case 'adtCoreDiscovery':
             case 'adtCompatibiliyGraph':
-                result = await this.discoveryHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.discoveryHandlers.handle(name, args);
                 break;
             case 'unitTestRun':
             case 'unitTestEvaluation':
             case 'unitTestOccurrenceMarkers':
             case 'createTestInclude':
-                result = await this.unitTestHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.unitTestHandlers.handle(name, args);
                 break;
             case 'prettyPrinterSetting':
             case 'setPrettyPrinterSetting':
             case 'prettyPrinter':
-                result = await this.prettyPrinterHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.prettyPrinterHandlers.handle(name, args);
                 break;
             case 'gitRepos':
             case 'gitExternalRepoInfo':
@@ -322,26 +374,26 @@ export class AbapAdtServer extends Server {
             case 'checkRepo':
             case 'remoteRepoInfo':
             case 'switchRepoBranch':
-                result = await this.gitHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.gitHandlers.handle(name, args);
                 break;
             case 'annotationDefinitions':
             case 'ddicElement':
             case 'ddicRepositoryAccess':
             case 'packageSearchHelp':
-                result = await this.ddicHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.ddicHandlers.handle(name, args);
                 break;
             case 'publishServiceBinding':
             case 'unPublishServiceBinding':
             case 'bindingDetails':
-                result = await this.serviceBindingHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.serviceBindingHandlers.handle(name, args);
                 break;
             case 'tableContents':
             case 'runQuery':
-                result = await this.queryHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.queryHandlers.handle(name, args);
                 break;
             case 'feeds':
             case 'dumps':
-                result = await this.feedHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.feedHandlers.handle(name, args);
                 break;
             case 'debuggerListeners':
             case 'debuggerListen':
@@ -356,12 +408,12 @@ export class AbapAdtServer extends Server {
             case 'debuggerStep':
             case 'debuggerGoToStack':
             case 'debuggerSetVariableValue':
-                result = await this.debugHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.debugHandlers.handle(name, args);
                 break;
             case 'renameEvaluate':
             case 'renamePreview':
             case 'renameExecute':
-                result = await this.renameHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.renameHandlers.handle(name, args);
                 break;
             case 'atcCustomizing':
             case 'atcCheckVariant':
@@ -373,7 +425,7 @@ export class AbapAdtServer extends Server {
             case 'isProposalMessage':
             case 'atcContactUri':
             case 'atcChangeContact':
-                result = await this.atcHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.atcHandlers.handle(name, args);
                 break;
             case 'tracesList':
             case 'tracesListRequests':
@@ -384,28 +436,24 @@ export class AbapAdtServer extends Server {
             case 'tracesCreateConfiguration':
             case 'tracesDeleteConfiguration':
             case 'tracesDelete':
-                result = await this.traceHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.traceHandlers.handle(name, args);
                 break;
             case 'extractMethodEvaluate':
             case 'extractMethodPreview':
             case 'extractMethodExecute':
-                result = await this.refactorHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.refactorHandlers.handle(name, args);
                 break;
             case 'revisions':
-                result = await this.revisionHandlers.handle(request.params.name, request.params.arguments);
+                result = await this.revisionHandlers.handle(name, args);
                 break;
             case 'healthcheck':
                 result = { status: 'healthy', timestamp: new Date().toISOString() };
                 break;
             default:
-                throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+                throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
 
-        return this.serializeResult(result);
-      } catch (error) {
-        return this.handleError(error);
-      }
-    });
+        return result;
   }
 
   async run() {
